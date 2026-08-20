@@ -1,0 +1,1 @@
+{"name":"prod-smoke-internal-tool-matrix-1787228899-production-web","version":"0.1.0","scripts":{"dev":"vite","build":"vite build"},"devDependencies":{"@sveltejs/vite-plugin-svelte":"^2.4.6","svelte":"^4.2.2","vite":"^4.5.0"},"dependencies":{"svelte":"^4.2.2"}}

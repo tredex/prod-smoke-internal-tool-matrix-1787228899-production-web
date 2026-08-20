@@ -1,0 +1,145 @@
+name: Build & Deploy
+on: [push]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        if: ${{ !env.ACT }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ACT-only: act runs this workflow in a local container that can reach
+      # ministack (LocalStack-compatible AWS emulator) but has no OIDC
+      # provider and no real role to assume, so swap in static test creds
+      # pointed at ministack. AWS_ENDPOINT_URL is honored natively by the aws
+      # CLI for every subsequent call in this job. Never set on real GitHub
+      # (ACT is act-only).
+      - name: Configure static test credentials (local act + ministack only)
+        if: ${{ env.ACT }}
+        run: |
+          command -v aws >/dev/null || {
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install >/dev/null 2>&1 || /tmp/aws/install >/dev/null
+          }
+          echo "AWS_ACCESS_KEY_ID=test" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=test" >> "$GITHUB_ENV"
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" >> "$GITHUB_ENV"
+          echo "AWS_ENDPOINT_URL=http://ministack:4566" >> "$GITHUB_ENV"
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        if: ${{ !env.ACT }}
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # docker login/build/push go through the HOST's docker daemon (act
+      # bind-mounts the host socket), so they resolve hostnames from the
+      # host's namespace via ministack's published port — not the job
+      # container's ministack_default network. aws CLI calls above run
+      # inside the job container itself and use the ministack:4566 network
+      # alias instead. Two different paths to the same emulator.
+      - name: Login to ministack ECR (local act only)
+        id: ecr-login-local
+        if: ${{ env.ACT }}
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin localhost:4566
+          echo "registry=localhost:4566" >> "$GITHUB_OUTPUT"
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ secrets.ECR_REPOSITORY }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ secrets.ECR_REPOSITORY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        run: |
+          REGISTRY="${{ steps.ecr-login.outputs.registry || steps.ecr-login-local.outputs.registry }}"
+          IMAGE="$REGISTRY/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}"
+          IMAGE_LATEST="$REGISTRY/${{ secrets.ECR_REPOSITORY }}:latest"
+          docker build -t "$IMAGE" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE"
+          docker push "$IMAGE_LATEST"
+
+
+      - name: Trigger Stelm auto-deploy
+        if: success()
+        env:
+          ZT_DEPLOY_TOKEN: ${{ secrets.ZT_DEPLOY_TOKEN }}
+          ZT_API_URL: ${{ secrets.ZT_API_URL }}
+          ZT_PROJECT_ID: ${{ secrets.ZT_PROJECT_ID }}
+          ZT_RESOURCE_ID: ${{ secrets.ZT_RESOURCE_ID }}
+        run: |
+          # Fire-and-forget: webhook failure must NOT fail CI — the
+          # image is already in ECR, so a missed roll just means the
+          # user has to click Re-deploy on the Stelm platform
+          # manually. Skip cleanly when secrets aren't configured
+          # (e.g. project was scaffolded before auto-deploy existed).
+          if [ -z "$ZT_DEPLOY_TOKEN" ] || [ -z "$ZT_API_URL" ]; then
+            echo "Stelm auto-deploy not configured (skipping)"
+            exit 0
+          fi
+          PAYLOAD=$(jq -n \
+            --arg tag "${{ github.sha }}" \
+            --arg msg "${{ github.event.head_commit.message }}" \
+            '{image_tag: $tag, commit_sha: $tag, commit_message: $msg}')
+          # Report the outcome accurately. The platform distinguishes
+          # three answers, and they mean very different things to whoever
+          # reads this log:
+          #   2xx  rolled now, or accepted while infra finishes
+          #        provisioning (normal on a first deploy — the image
+          #        waits in ECR and is rolled out automatically)
+          #   410  the Stelm project is gone; this repo outlived it, so
+          #        no deploy will ever happen and Re-deploy cannot help
+          #   else something went wrong, but the image is safely in ECR
+          CODE=$(curl -sS --max-time 30 -o /tmp/stelm-deploy.out -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $ZT_DEPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$ZT_API_URL/api/projects/$ZT_PROJECT_ID/components/$ZT_RESOURCE_ID/refresh-image" || echo 000)
+          case "$CODE" in
+            2*)  echo "Stelm notified (HTTP $CODE): $(cat /tmp/stelm-deploy.out)" ;;
+            410) echo "Stelm project no longer exists — this repository outlived it. Nothing will be deployed." ;;
+            *)   echo "Stelm auto-deploy webhook failed (HTTP $CODE); image is in ECR. Click Re-deploy on the platform to roll." ;;
+          esac
+
+      - name: Notify Stelm of build failure
+        if: failure()
+        env:
+          ZT_DEPLOY_TOKEN: ${{ secrets.ZT_DEPLOY_TOKEN }}
+          ZT_API_URL: ${{ secrets.ZT_API_URL }}
+          ZT_PROJECT_ID: ${{ secrets.ZT_PROJECT_ID }}
+          ZT_RESOURCE_ID: ${{ secrets.ZT_RESOURCE_ID }}
+        run: |
+          # Fire-and-forget, same as the success step above: the job
+          # is already failing, so this must never mask that or fail
+          # a second time. Lets Stelm mark this component's build as
+          # failed the moment CI knows, instead of only discovering it
+          # after image_reconciler's give-up window.
+          if [ -z "$ZT_DEPLOY_TOKEN" ] || [ -z "$ZT_API_URL" ]; then
+            echo "Stelm auto-deploy not configured (skipping failure notice)"
+            exit 0
+          fi
+          PAYLOAD=$(jq -n \
+            --arg sha "${{ github.sha }}" \
+            --arg reason "CI build failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{status: "failed", commit_sha: $sha, failure_reason: $reason}')
+          curl -fsS --max-time 30 -X POST \
+            -H "Authorization: Bearer $ZT_DEPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$ZT_API_URL/api/projects/$ZT_PROJECT_ID/components/$ZT_RESOURCE_ID/refresh-image" \
+            || true
